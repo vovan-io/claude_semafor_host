@@ -8,7 +8,11 @@
       { "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" working" } ] }
     ],
     "PreToolUse": [
-      { "matcher": "", "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" working" } ] }
+      { "matcher": "", "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" working" } ] },
+      { "matcher": "Task", "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" substart" } ] }
+    ],
+    "SubagentStop": [
+      { "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" substop" } ] }
     ],
     "Notification": [
       { "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" attention" } ] }

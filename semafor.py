@@ -36,6 +36,7 @@ HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.path.join(HOME, ".claude")
 CFG_PATH = os.path.join(CLAUDE_DIR, "semafor.json")           # {addr, host_id, token}
 MAP_PATH = os.path.join(CLAUDE_DIR, "semafor-agents.json")    # session_id -> index
+SUBS_PATH = os.path.join(CLAUDE_DIR, "semafor-subs.json")     # session_id -> subagent count
 SETTINGS_PATH = os.path.join(CLAUDE_DIR, "settings.json")
 INSTALL_PATH = os.path.join(CLAUDE_DIR, "semafor.py")
 TIMEOUT = 2.5
@@ -50,11 +51,16 @@ STATE_ALIASES = {
     "end": "offline",     # SessionEnd
 }
 
-# Хуки Claude Code -> состояние (для команды install).
+# Спец-события субагентов (не шлют state, обновляют счётчик -> /subs).
+SUB_EVENTS = {"substart", "substop"}
+
+# Хуки Claude Code -> слово-событие (для команды install). matcher: None или строка.
 HOOK_EVENTS = [
     ("SessionStart", "idle", None),
     ("UserPromptSubmit", "working", None),
-    ("PreToolUse", "working", ""),      # matcher "" = все инструменты
+    ("PreToolUse", "working", ""),          # matcher "" = все инструменты
+    ("PreToolUse", "substart", "Task"),     # запуск субагента (инструмент Task)
+    ("SubagentStop", "substop", None),      # субагент завершился
     ("Notification", "attention", None),
     ("Stop", "done", None),
     ("SessionEnd", "end", None),
@@ -98,9 +104,56 @@ def file_lock(path):
 def http_request(addr, path, fields=None, headers=None, method=None):
     url = "http://%s%s" % (addr, path)
     data = urllib.parse.urlencode(fields).encode() if fields is not None else None
-    req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+    hdr = dict(headers or {})
+    hdr.setdefault("Connection", "close")   # без keep-alive: Arduino WebServer иначе тормозит ответ
+    req = urllib.request.Request(url, data=data, headers=hdr, method=method)
     with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
         return resp.status, resp.read().decode(errors="replace")
+
+
+def resolve_to_ip(addr):
+    """host[:port] -> ip[:port] (один mDNS-резолв). При ошибке — как есть."""
+    host = addr.split(":", 1)[0]
+    port = addr[len(host):]        # ":port" или ""
+    try:
+        return socket.gethostbyname(host) + port
+    except OSError:
+        return addr
+
+
+def ensure_device_ip(cfg):
+    """Миграция старого конфига: addr=hostname -> IP (mDNS один раз), фолбэк в mdns."""
+    addr = cfg.get("addr", "")
+    host = addr.split(":", 1)[0]
+    try:
+        socket.inet_aton(host)      # уже IP -> ничего не делаем
+        return cfg
+    except OSError:
+        pass
+    cfg.setdefault("mdns", addr)
+    cfg["addr"] = resolve_to_ip(addr)
+    save_json(CFG_PATH, cfg)
+    return cfg
+
+
+def device_post(cfg, path, fields):
+    """POST на устройство: сначала сохранённый IP, при ошибке — mDNS-имя."""
+    headers = {"X-Semafor-Token": str(cfg["token"]),
+               "Content-Type": "application/x-www-form-urlencoded"}
+    targets = []
+    if cfg.get("addr"):
+        targets.append(cfg["addr"])
+    if cfg.get("mdns") and cfg["mdns"] not in targets:
+        targets.append(cfg["mdns"])
+    last = None
+    for t in targets:
+        try:
+            return http_request(t, path, fields, headers)
+        except Exception as e:  # noqa: BLE001
+            last = e
+    if last:
+        print("post failed: %s" % last, file=sys.stderr)
+    return None
 
 
 def device_addr(args):
@@ -126,15 +179,19 @@ def cmd_register(args):
         print("pair rejected (%s): %s" % (status, body), file=sys.stderr)
         return 1
     info = json.loads(body)
-    cfg = {"addr": addr, "host_id": info["host_id"], "token": info["token"], "leds": 10}
+    # Резолвим mDNS-имя в IP один раз: события потом бьют по IP (без mDNS на
+    # каждый запрос), а имя остаётся запасным адресом на случай смены IP.
+    ip_addr = resolve_to_ip(addr)
+    cfg = {"addr": ip_addr, "mdns": addr,
+           "host_id": info["host_id"], "token": info["token"], "leds": 10}
     try:  # узнаём число диодов, чтобы не назначать агентов сверх ленты
-        _, cbody = http_request(addr, "/config")
+        _, cbody = http_request(ip_addr, "/config")
         cfg["leds"] = int(json.loads(cbody).get("leds", 10))
     except Exception:  # noqa: BLE001
         pass
     save_json(CFG_PATH, cfg)
-    print("paired as host_id=%s (name=%s) via %s, leds=%d"
-          % (info["host_id"], name, addr, cfg["leds"]))
+    print("paired as host_id=%s (name=%s) via %s (mdns %s), leds=%d"
+          % (info["host_id"], name, ip_addr, addr, cfg["leds"]))
     print("saved -> %s" % CFG_PATH)
     return 0
 
@@ -170,6 +227,38 @@ def resolve_index(session_id, release=False, max_agents=10):
         return 0
 
 
+# ------------------------------------------------------------------ субагенты
+def post_subs(cfg):
+    with file_lock(SUBS_PATH):
+        total = sum(load_json(SUBS_PATH, {}).values())
+    device_post(cfg, "/subs", {"n": total})
+
+
+def update_subs(cfg, session_id, delta=0, reset=False):
+    with file_lock(SUBS_PATH):
+        subs = load_json(SUBS_PATH, {})
+        if reset:
+            subs.pop(session_id, None)
+        else:
+            v = subs.get(session_id, 0) + delta
+            if v > 0:
+                subs[session_id] = v
+            else:
+                subs.pop(session_id, None)
+        save_json(SUBS_PATH, subs)
+    post_subs(cfg)
+
+
+def cmd_subevent(word):
+    cfg = load_json(CFG_PATH, None)
+    if not cfg:
+        return 0
+    cfg = ensure_device_ip(cfg)
+    session_id = read_hook_stdin()
+    update_subs(cfg, session_id, delta=(+1 if word == "substart" else -1))
+    return 0
+
+
 def cmd_event(state_word):
     state = STATE_ALIASES.get(state_word)
     if state is None:
@@ -180,19 +269,18 @@ def cmd_event(state_word):
     if not cfg:
         print("not paired yet (run: semafor.py register); skipping", file=sys.stderr)
         return 0  # хук не должен падать
+    cfg = ensure_device_ip(cfg)
 
     session_id = read_hook_stdin()
     idx = resolve_index(session_id, release=(state == "offline"),
                         max_agents=int(cfg.get("leds", 10)))
+    # конец хода/сессии — сбрасываем субагентов сессии (страховка от «утечки»)
+    if state_word in ("done", "end"):
+        update_subs(cfg, session_id, reset=True)
     if idx is None:
         return 0
 
-    headers = {"X-Semafor-Token": str(cfg["token"]),
-               "Content-Type": "application/x-www-form-urlencoded"}
-    try:
-        http_request(cfg["addr"], "/agent/%d" % idx, {"state": state}, headers)
-    except Exception as e:  # noqa: BLE001
-        print("semafor post failed: %s" % e, file=sys.stderr)
+    device_post(cfg, "/agent/%d" % idx, {"state": state})
     return 0
 
 
@@ -260,7 +348,7 @@ def cmd_test(args):
 
 # ------------------------------------------------------------------ unpair
 def cmd_unpair(_args):
-    for p in (CFG_PATH, MAP_PATH):
+    for p in (CFG_PATH, MAP_PATH, SUBS_PATH):
         try:
             os.remove(p)
             print("removed %s" % p)
@@ -278,10 +366,12 @@ def _hook_entry(state, matcher):
     return entry
 
 
-def _has_semafor(groups):
+def _has_command(groups, cmd):
+    # Дедуп по точной команде: под одним событием может быть несколько наших
+    # хуков (напр. PreToolUse: working + substart).
     for g in groups:
         for hk in g.get("hooks", []):
-            if "semafor.py" in hk.get("command", ""):
+            if hk.get("command") == cmd:
                 return True
     return False
 
@@ -306,9 +396,10 @@ def cmd_install(args):
     added = 0
     for event, state, matcher in HOOK_EVENTS:
         groups = hooks.setdefault(event, [])
-        if _has_semafor(groups):
+        entry = _hook_entry(state, matcher)
+        if _has_command(groups, entry["hooks"][0]["command"]):
             continue
-        groups.append(_hook_entry(state, matcher))
+        groups.append(entry)
         added += 1
     save_json(SETTINGS_PATH, settings)
     print("hooks installed into %s (added %d, backup .bak)" % (SETTINGS_PATH, added))
@@ -351,9 +442,11 @@ def build_parser():
 
 
 def main(argv):
-    # Событийный шорткат для хуков: `semafor.py working` и т.п.
+    # Событийный шорткат для хуков: `semafor.py working` / `semafor.py substart` и т.п.
     if len(argv) == 1 and argv[0] in STATE_ALIASES:
         return cmd_event(argv[0])
+    if len(argv) == 1 and argv[0] in SUB_EVENTS:
+        return cmd_subevent(argv[0])
 
     parser = build_parser()
     args = parser.parse_args(argv)
