@@ -1,0 +1,23 @@
+{
+  "_comment": "Merge the contents of \"hooks\" into ~/.claude/settings.json. Adjust the path to semafor.py if you did not copy it to ~/.claude/. The hook JSON (with session_id) is piped to the script on stdin automatically.",
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" idle" } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" working" } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "", "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" working" } ] }
+    ],
+    "Notification": [
+      { "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" attention" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" done" } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" end" } ] }
+    ]
+  }
+}
