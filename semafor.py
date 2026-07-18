@@ -229,9 +229,20 @@ def resolve_index(session_id, release=False, max_agents=10):
 
 # ------------------------------------------------------------------ субагенты
 def post_subs(cfg):
+    # Маска, КАКИЕ агенты (диоды) сейчас имеют активный субагент — не просто
+    # число: устройство переливает именно диод того агента жёлтый<->белый.
     with file_lock(SUBS_PATH):
-        total = sum(load_json(SUBS_PATH, {}).values())
-    device_post(cfg, "/subs", {"n": total})
+        subs = load_json(SUBS_PATH, {})
+    with file_lock(MAP_PATH):
+        agent_map = load_json(MAP_PATH, {})
+    mask = 0
+    for session_id, count in subs.items():
+        if count <= 0:
+            continue
+        idx = agent_map.get(session_id)
+        if idx is not None:
+            mask |= (1 << idx)
+    device_post(cfg, "/subs", {"mask": "%x" % mask})
 
 
 def update_subs(cfg, session_id, delta=0, reset=False):
