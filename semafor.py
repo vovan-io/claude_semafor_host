@@ -54,6 +54,13 @@ STATE_ALIASES = {
 # Спец-события субагентов (не шлют state, обновляют счётчик -> /subs).
 SUB_EVENTS = {"substart", "substop"}
 
+# Ручные события лимита (для теста): `semafor.py limit` / `semafor.py limit-clear`.
+LIMIT_EVENTS = {"limit", "limit-clear"}
+
+# Подстроки в тексте Notification-хука, означающие «достигнут лимит».
+# (Claude Code не имеет отдельного хука лимита — сигнал приходит как Notification.)
+LIMIT_MARKERS = ("usage limit", "limit reached", "rate limit")
+
 # Хуки Claude Code -> слово-событие (для команды install). matcher: None или строка.
 HOOK_EVENTS = [
     ("SessionStart", "idle", None),
@@ -197,13 +204,27 @@ def cmd_register(args):
 
 
 # ------------------------------------------------------------------ session -> index
+_hook_payload = None
+
+
+def _read_hook_payload():
+    # stdin можно прочитать лишь раз — кешируем весь JSON payload хука.
+    global _hook_payload
+    if _hook_payload is None:
+        try:
+            raw = sys.stdin.read()
+            _hook_payload = json.loads(raw) if raw.strip() else {}
+        except (ValueError, OSError):
+            _hook_payload = {}
+    return _hook_payload
+
+
 def read_hook_stdin():
-    try:
-        raw = sys.stdin.read()
-        data = json.loads(raw) if raw.strip() else {}
-    except ValueError:
-        data = {}
-    return data.get("session_id", "default")
+    return _read_hook_payload().get("session_id", "default")
+
+
+def read_hook_message():
+    return str(_read_hook_payload().get("message", ""))
 
 
 def resolve_index(session_id, release=False, max_agents=10):
@@ -270,6 +291,23 @@ def cmd_subevent(word):
     return 0
 
 
+def _post_limit(cfg, on):
+    # best-effort: хук не должен падать, если устройство недоступно.
+    try:
+        device_post(cfg, "/limit", {"on": "1" if on else "0"})
+    except Exception as e:
+        print("limit post failed: %s" % e, file=sys.stderr)
+
+
+def cmd_limit(on):
+    cfg = load_json(CFG_PATH, None)
+    if not cfg:
+        return 0
+    cfg = ensure_device_ip(cfg)
+    _post_limit(cfg, on)
+    return 0
+
+
 def cmd_event(state_word):
     state = STATE_ALIASES.get(state_word)
     if state is None:
@@ -281,6 +319,16 @@ def cmd_event(state_word):
         print("not paired yet (run: semafor.py register); skipping", file=sys.stderr)
         return 0  # хук не должен падать
     cfg = ensure_device_ip(cfg)
+
+    # Notification с текстом про лимит -> режим «лимит» на устройстве (а не attention).
+    if state_word == "attention":
+        msg = read_hook_message().lower()
+        if any(m in msg for m in LIMIT_MARKERS):
+            _post_limit(cfg, True)
+            return 0
+    # Новая сессия -> снимаем возможный алерт лимита.
+    if state_word == "idle":
+        _post_limit(cfg, False)
 
     session_id = read_hook_stdin()
     idx = resolve_index(session_id, release=(state == "offline"),
@@ -458,6 +506,8 @@ def main(argv):
         return cmd_event(argv[0])
     if len(argv) == 1 and argv[0] in SUB_EVENTS:
         return cmd_subevent(argv[0])
+    if len(argv) == 1 and argv[0] in LIMIT_EVENTS:
+        return cmd_limit(argv[0] == "limit")
 
     parser = build_parser()
     args = parser.parse_args(argv)
