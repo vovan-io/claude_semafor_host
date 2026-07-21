@@ -9,13 +9,14 @@
     ],
     "PreToolUse": [
       { "matcher": "", "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" working" } ] },
-      { "matcher": "Task", "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" substart" } ] }
+      { "matcher": "Task", "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" substart" } ] },
+      { "matcher": "AskUserQuestion", "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" attention" } ] }
     ],
     "SubagentStop": [
       { "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" substop" } ] }
     ],
     "Notification": [
-      { "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" attention" } ] }
+      { "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" notify" } ] }
     ],
     "Stop": [
       { "hooks": [ { "type": "command", "command": "python3 \"$HOME/.claude/semafor.py\" done" } ] }

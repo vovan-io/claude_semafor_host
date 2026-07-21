@@ -37,6 +37,7 @@ CLAUDE_DIR = os.path.join(HOME, ".claude")
 CFG_PATH = os.path.join(CLAUDE_DIR, "semafor.json")           # {addr, host_id, token}
 MAP_PATH = os.path.join(CLAUDE_DIR, "semafor-agents.json")    # session_id -> index
 SUBS_PATH = os.path.join(CLAUDE_DIR, "semafor-subs.json")     # session_id -> subagent count
+STATE_PATH = os.path.join(CLAUDE_DIR, "semafor-state.json")   # session_id -> last state
 SETTINGS_PATH = os.path.join(CLAUDE_DIR, "settings.json")
 INSTALL_PATH = os.path.join(CLAUDE_DIR, "semafor.py")
 TIMEOUT = 2.5
@@ -57,6 +58,10 @@ SUB_EVENTS = {"substart", "substop"}
 # Ручные события лимита (для теста): `semafor.py limit` / `semafor.py limit-clear`.
 LIMIT_EVENTS = {"limit", "limit-clear"}
 
+# Спец-событие Notification: attention, но НЕ поднимаем красный после завершения
+# хода (иначе зелёный «done» через ~минуту простоя мигал бы красным). См. cmd_notify.
+NOTIFY_EVENTS = {"notify"}
+
 # Подстроки в тексте Notification-хука, означающие «достигнут лимит».
 # (Claude Code не имеет отдельного хука лимита — сигнал приходит как Notification.)
 LIMIT_MARKERS = ("usage limit", "limit reached", "rate limit")
@@ -67,8 +72,9 @@ HOOK_EVENTS = [
     ("UserPromptSubmit", "working", None),
     ("PreToolUse", "working", ""),          # matcher "" = все инструменты
     ("PreToolUse", "substart", "Task"),     # запуск субагента (инструмент Task)
+    ("PreToolUse", "attention", "AskUserQuestion"),  # агент спрашивает пользователя
     ("SubagentStop", "substop", None),      # субагент завершился
-    ("Notification", "attention", None),
+    ("Notification", "notify", None),       # attention/лимит, но не после done (см. cmd_notify)
     ("Stop", "done", None),
     ("SessionEnd", "end", None),
 ]
@@ -227,6 +233,23 @@ def read_hook_message():
     return str(_read_hook_payload().get("message", ""))
 
 
+def set_last_state(session_id, state):
+    """Запоминаем последнее состояние сессии — нужно, чтобы Notification после
+    done/offline не поднимал красный (см. cmd_notify)."""
+    with file_lock(STATE_PATH):
+        st = load_json(STATE_PATH, {})
+        if state == "offline":
+            st.pop(session_id, None)
+        else:
+            st[session_id] = state
+        save_json(STATE_PATH, st)
+
+
+def get_last_state(session_id):
+    with file_lock(STATE_PATH):
+        return load_json(STATE_PATH, {}).get(session_id)
+
+
 def resolve_index(session_id, release=False, max_agents=10):
     with file_lock(MAP_PATH):
         mp = load_json(MAP_PATH, {})
@@ -320,12 +343,6 @@ def cmd_event(state_word):
         return 0  # хук не должен падать
     cfg = ensure_device_ip(cfg)
 
-    # Notification с текстом про лимит -> режим «лимит» на устройстве (а не attention).
-    if state_word == "attention":
-        msg = read_hook_message().lower()
-        if any(m in msg for m in LIMIT_MARKERS):
-            _post_limit(cfg, True)
-            return 0
     # Новая сессия -> снимаем возможный алерт лимита.
     if state_word == "idle":
         _post_limit(cfg, False)
@@ -333,6 +350,7 @@ def cmd_event(state_word):
     session_id = read_hook_stdin()
     idx = resolve_index(session_id, release=(state == "offline"),
                         max_agents=int(cfg.get("leds", 10)))
+    set_last_state(session_id, state)
     # конец хода/сессии — сбрасываем субагентов сессии (страховка от «утечки»)
     if state_word in ("done", "end"):
         update_subs(cfg, session_id, reset=True)
@@ -340,6 +358,35 @@ def cmd_event(state_word):
         return 0
 
     device_post(cfg, "/agent/%d" % idx, {"state": state})
+    return 0
+
+
+def cmd_notify():
+    """Хук Notification. Два случая:
+    1) текст содержит маркер лимита -> режим «лимит» на устройстве;
+    2) иначе это attention («жду ввода»/permission). НО после завершения хода
+       (last state == done/offline/None) Claude Code шлёт «жду ввода» — красный
+       тут не нужен, оставляем зелёный. Красный поднимаем только при запросе во
+       время working (last state == working)."""
+    cfg = load_json(CFG_PATH, None)
+    if not cfg:
+        return 0
+    cfg = ensure_device_ip(cfg)
+
+    # Notification с текстом про лимит -> режим «лимит» (важнее attention).
+    msg = read_hook_message().lower()
+    if any(m in msg for m in LIMIT_MARKERS):
+        _post_limit(cfg, True)
+        return 0
+
+    session_id = read_hook_stdin()
+    if get_last_state(session_id) in ("done", "offline", None):
+        return 0
+    idx = resolve_index(session_id, max_agents=int(cfg.get("leds", 10)))
+    if idx is None:
+        return 0
+    set_last_state(session_id, "attention")
+    device_post(cfg, "/agent/%d" % idx, {"state": "attention"})
     return 0
 
 
@@ -407,7 +454,7 @@ def cmd_test(args):
 
 # ------------------------------------------------------------------ unpair
 def cmd_unpair(_args):
-    for p in (CFG_PATH, MAP_PATH, SUBS_PATH):
+    for p in (CFG_PATH, MAP_PATH, SUBS_PATH, STATE_PATH):
         try:
             os.remove(p)
             print("removed %s" % p)
@@ -452,6 +499,25 @@ def cmd_install(args):
     if os.path.exists(SETTINGS_PATH):
         save_json(SETTINGS_PATH + ".bak", settings)
     hooks = settings.setdefault("hooks", {})
+
+    # 2a) миграция: выкидываем НАШИ устаревшие хуки, которых больше нет в
+    # HOOK_EVENTS (напр. старый Notification -> attention). Чужие не трогаем.
+    desired = {}
+    for event, state, matcher in HOOK_EVENTS:
+        cmd = _hook_entry(state, matcher)["hooks"][0]["command"]
+        desired.setdefault(event, set()).add(cmd)
+    removed = 0
+    for event, groups in list(hooks.items()):
+        kept = []
+        for g in groups:
+            hks = g.get("hooks", [])
+            ours = [hk for hk in hks if "semafor.py" in (hk.get("command") or "")]
+            if len(hks) == 1 and ours and hks[0].get("command") not in desired.get(event, set()):
+                removed += 1
+                continue
+            kept.append(g)
+        hooks[event] = kept
+
     added = 0
     for event, state, matcher in HOOK_EVENTS:
         groups = hooks.setdefault(event, [])
@@ -461,7 +527,8 @@ def cmd_install(args):
         groups.append(entry)
         added += 1
     save_json(SETTINGS_PATH, settings)
-    print("hooks installed into %s (added %d, backup .bak)" % (SETTINGS_PATH, added))
+    print("hooks installed into %s (added %d, removed %d stale, backup .bak)"
+          % (SETTINGS_PATH, added, removed))
     if not load_json(CFG_PATH, None):
         print("next: put device in PAIRING (long press) and run: semafor.py register")
     return 0
@@ -506,6 +573,8 @@ def main(argv):
         return cmd_event(argv[0])
     if len(argv) == 1 and argv[0] in SUB_EVENTS:
         return cmd_subevent(argv[0])
+    if len(argv) == 1 and argv[0] in NOTIFY_EVENTS:
+        return cmd_notify()
     if len(argv) == 1 and argv[0] in LIMIT_EVENTS:
         return cmd_limit(argv[0] == "limit")
 
