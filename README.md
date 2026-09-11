@@ -1,11 +1,11 @@
 # Claude Semafor — host side
 
-Мост между хуками Claude Code и устройством-семафором. Хуки — короткоживущие
-процессы, поэтому связь по WiFi HTTP: `semafor.py` при событии делает POST на
-устройство (`semafor.local`). Зависимостей нет — только стандартная библиотека
-Python 3 (`curl` не нужен).
+The bridge between the Claude Code hooks and the semaphore device. Hooks are
+short-lived processes, so the link is WiFi HTTP: on each event `semafor.py` POSTs
+to the device (`semafor.local`). No dependencies — the Python 3 standard library
+only (`curl` is not required).
 
-## Как это работает
+## How it works
 
 ```
 Claude Code session
@@ -13,59 +13,60 @@ Claude Code session
   ├─ Notification                  → semafor.py attention → 🔴
   ├─ Stop                          → semafor.py done      → 🟢
   ├─ SessionStart                  → semafor.py idle
-  └─ SessionEnd                    → semafor.py end (освобождает диод)
+  └─ SessionEnd                    → semafor.py end (frees the LED)
              │ POST http://semafor.local/agent/{idx}  (X-Semafor-Token)
              ▼
-        ESP32-C3  →  LED[idx] активного хоста
+        ESP32-C3  →  LED[idx] of the active host
 ```
 
-`session_id` из хука маппится на индекс диода `0..N-1` (файл
-`~/.claude/semafor-agents.json`, доступ под файловой блокировкой — параллельные
-сессии не мешают друг другу). Один компьютер = один «хост» на устройстве; его
-сессии занимают диоды ленты активного хоста.
+The `session_id` from the hook is mapped to an LED index `0..N-1` (stored in
+`~/.claude/semafor-agents.json`, accessed under a file lock so concurrent
+sessions do not clash). One computer is one "host" on the device; its sessions
+occupy the LEDs of the strip while that host is active.
 
-## Установка за 3 шага
+## Install in three steps
 
 ```sh
-# 1) скопировать скрипт в ~/.claude и вписать хуки в settings.json (идемпотентно,
-#    существующие настройки сохраняются, создаётся settings.json.bak)
+# 1) copy the script into ~/.claude and add the hooks to settings.json (idempotent;
+#    existing settings are preserved and a settings.json.bak is created)
 python3 host/semafor.py install
 
-# 2) на устройстве длинным нажатием кнопки войти в PAIRING (на OLED — таймер), затем:
-python3 ~/.claude/semafor.py register            # --name "macbook" --host 192.168.1.108 при желании
+# 2) long-press the button on the device to enter PAIRING (a timer appears on the OLED), then:
+python3 ~/.claude/semafor.py register            # optionally --name "macbook" --host 192.168.1.108
 
-# 3) запустить сессию Claude Code — диод пройдёт цикл 🟡→🔴→🟢
+# 3) start a Claude Code session — the LED will run through 🟡→🔴→🟢
 ```
 
-`register` заодно узнаёт у устройства число диодов и сохраняет его, чтобы не
-назначать сессии сверх длины ленты. Всё лежит в `~/.claude/semafor.json`.
+`register` also asks the device for its LED count and stores it, so sessions are
+never assigned beyond the length of the strip. Everything lives in
+`~/.claude/semafor.json`.
 
-## Команды CLI
+## CLI commands
 
 ```sh
-semafor.py status                    # состояние всех хостов/агентов
-semafor.py config                    # показать настройки устройства
-semafor.py config --leds 8           # задать число диодов (сохранится в NVS)
+semafor.py status                    # state of every host and agent
+semafor.py config                    # show the device settings
+semafor.py config --leds 8           # set the LED count (persisted to NVS)
 semafor.py config --bright 128 --contrast 100
-semafor.py test                      # прогнать агента 0 по цветам (проверка ленты)
-semafor.py unpair                    # забыть локальную привязку
+semafor.py test                      # cycle agent 0 through the colours (strip check)
+semafor.py unpair                    # forget the local pairing
 ```
 
-Любую команду можно направить на конкретный адрес: `--host 192.168.1.108`.
+Any command can be aimed at a specific address with `--host 192.168.1.108`.
 
-## Несколько компьютеров
+## Several computers
 
-Повторите `install` + `register` с каждого компьютера (каждый занимает свой слот
-хоста, до `MAX_HOSTS`). На устройстве коротким нажатием кнопки переключайте, чьи
-агенты показывает лента; если у неактивного хоста есть 🔴-агент — на OLED «!».
+Run `install` + `register` from each computer (each takes its own host slot, up
+to `MAX_HOSTS`). A short press on the device switches which host's agents the
+strip shows; if an inactive host has a 🔴 agent, a `!` appears on the OLED.
 
-## Первичная настройка WiFi
+## First-time WiFi setup
 
-Если устройство не видит сохранённую сеть дольше 30 c, оно поднимает точку
-доступа `Semafor-XXXX` с captive-порталом (`192.168.4.1`) — подключитесь и
-введите SSID/пароль. Настройки сохраняются в NVS.
+If the device cannot see a stored network for more than 30s it raises the access
+point `Semafor-XXXX` with a captive portal (`192.168.4.1`) — connect to it and
+enter the SSID and password. The credentials are stored in NVS.
 
-## Ручная проверка без хуков
+## Manual check without hooks
 
 ```sh
 TOKEN=$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.claude/semafor.json')))['token'])")
