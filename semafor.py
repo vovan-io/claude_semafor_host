@@ -10,8 +10,6 @@ Commands:
   status   [--host H]              show the state of every host and agent
   config   [--leds N --bright N --contrast N]   read or set the device settings
   test     [--host H]              cycle agent 0 through the colours (visual check)
-  ota      [--fs] [--file F]       flash firmware (or the web UI) over WiFi, no USB
-  calib    [--save F] [--restore F]  battery ADC calibration table
   unpair                           forget the local pairing
 
 Event mode (invoked from the hooks; the event JSON is read from stdin):
@@ -412,68 +410,6 @@ def cmd_status(args):
     return 0
 
 
-# ------------------------------------------------------------------ ota
-DEFAULT_FW = ".pio/build/esp32-c3-devkitm-1/firmware.bin"
-DEFAULT_FS = ".pio/build/esp32-c3-devkitm-1/littlefs.bin"
-
-
-def cmd_ota(args):
-    """Push a firmware (or filesystem) image to the device over HTTP.
-
-    Built by hand rather than with a library so the script keeps its
-    no-dependencies promise. The device streams the body straight into the
-    inactive OTA slot, so even a 1.3MB image never has to fit in its RAM.
-    """
-    cfg = load_json(CFG_PATH, {})
-    if not cfg.get("token"):
-        print("not paired: run `semafor.py register` first", file=sys.stderr)
-        return 1
-    addr = device_addr(args)
-
-    path = args.file or (DEFAULT_FS if args.fs else DEFAULT_FW)
-
-    # PlatformIO's custom upload_command is shared by the `upload` and `uploadfs`
-    # targets and only varies $SOURCE, so infer the image kind from its name.
-    # An explicit --fs still wins.
-    is_fs = args.fs or os.path.basename(path).startswith(("littlefs", "spiffs"))
-
-    if not os.path.isfile(path):
-        print("image not found: %s\n(build it first: pio run%s)"
-              % (path, " -t buildfs" if is_fs else ""), file=sys.stderr)
-        return 1
-    with open(path, "rb") as f:
-        image = f.read()
-
-    boundary = "----semafor%d" % int(time.time())
-    head = ("--%s\r\n"
-            'Content-Disposition: form-data; name="image"; filename="%s"\r\n'
-            "Content-Type: application/octet-stream\r\n\r\n"
-            % (boundary, os.path.basename(path))).encode()
-    tail = ("\r\n--%s--\r\n" % boundary).encode()
-    body = head + image + tail
-
-    url = "http://%s/update%s" % (addr, "?type=fs" if is_fs else "")
-    req = urllib.request.Request(url, data=body, method="POST", headers={
-        "X-Semafor-Token": str(cfg["token"]),
-        "Content-Type": "multipart/form-data; boundary=%s" % boundary,
-        "Content-Length": str(len(body)),
-        "Connection": "close",
-    })
-
-    print("uploading %s %s (%.1f KB) -> %s"
-          % ("filesystem" if is_fs else "firmware", os.path.basename(path),
-             len(image) / 1024.0, addr))
-    try:
-        # Generous timeout: erasing the target partition alone takes several seconds.
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            print(resp.read().decode(errors="replace"))
-    except Exception as e:  # noqa: BLE001
-        print("ota failed: %s" % e, file=sys.stderr)
-        return 1
-    print("device is rebooting into the new image; it will be back in a few seconds")
-    return 0
-
-
 # ------------------------------------------------------------------ config
 def cmd_config(args):
     addr = device_addr(args)
@@ -493,84 +429,6 @@ def cmd_config(args):
         print("config failed: %s" % e, file=sys.stderr)
         return 1
     print(body)
-    return 0
-
-
-# ------------------------------------------------------------------ calibration
-# The calibration file lives in fs/, which is what `pio run -t uploadfs` ships to
-# the device. Keeping one copy means --save updates the file that gets flashed.
-DEFAULT_CAL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "fs", "calibration.json")
-
-
-CAL_NOTE = ("Per-unit battery ADC calibration. Shipped by `pio run -t uploadfs`, loaded at "
-            "boot, rewritten by the device when a row is edited in calib.html. "
-            "Do NOT copy to another board. See README, 'Calibrating the battery gauge'.")
-
-
-def cmd_calib(args):
-    """Read, save or restore the battery ADC calibration table.
-
-    The table lives in the device's NVS and survives reflashing, but not an
-    erase_flash or a swap to another unit -- hence --save/--restore. Measuring it
-    takes a bench supply and half an hour, so it is worth keeping in a file.
-    """
-    addr = device_addr(args)
-
-    if args.restore:
-        data = load_json(args.restore, None)
-        if not data:
-            print("cannot read %s" % args.restore, file=sys.stderr)
-            return 1
-        points = data.get("points") or []
-        if not points:
-            print("no points in %s" % args.restore, file=sys.stderr)
-            return 1
-        try:
-            # Wipe first: restoring onto a non-empty table would merge the two.
-            http_request(addr, "/calib", {"clear": 1}, method="POST")
-            for raw, real in points:
-                http_request(addr, "/calib", {"raw": raw, "real": real}, method="POST")
-            cutoff = data.get("protection_cutoff_mv")
-            if cutoff:
-                http_request(addr, "/calib", {"cutoff": cutoff}, method="POST")
-        except Exception as e:  # noqa: BLE001
-            print("restore failed: %s" % e, file=sys.stderr)
-            return 1
-        print("restored %d points%s -> %s"
-              % (len(points), " + cutoff %dmV" % cutoff if cutoff else "", addr))
-
-    try:
-        _, body = http_request(addr, "/calib")
-    except Exception as e:  # noqa: BLE001
-        print("calib failed: %s" % e, file=sys.stderr)
-        return 1
-    data = json.loads(body)
-
-    if args.save:
-        # Written in the same shape and order the firmware itself writes, so a
-        # --save right after a device-side edit produces no spurious diff.
-        with open(args.save, "w") as f:
-            f.write("{\n")
-            f.write('  "_note": %s,\n' % json.dumps(CAL_NOTE))
-            f.write('  "protection_cutoff_mv": %d,\n' % data.get("cutoff", 0))
-            f.write('  "points": [\n')
-            pts = data.get("points", [])
-            for i, pt in enumerate(pts):
-                f.write("    [%d, %d]%s\n"
-                        % (pt["raw"], pt["real"], "," if i + 1 < len(pts) else ""))
-            f.write("  ]\n}\n")
-        print("saved %d points -> %s" % (len(data.get("points", [])), args.save))
-
-    print("now: raw %dmV -> %dmV (%d%%), charger %s"
-          % (data.get("raw", 0), data.get("mv", 0), data.get("pct", 0), data.get("chg", "?")))
-    print("protection cutoff %dmV, shutdown at %dmV"
-          % (data.get("cutoff", 0), data.get("critical", 0)))
-    print("  %-8s %-8s %s" % ("real", "raw", "correction"))
-    for pt in data.get("points", []):
-        print("  %-8d %-8d %+d" % (pt["real"], pt["raw"], pt["real"] - pt["raw"]))
-    if not data.get("points"):
-        print("  (table empty -- the gauge falls back to the DONE self-calibration)")
     return 0
 
 
@@ -701,24 +559,9 @@ def build_parser():
     c.add_argument("--contrast", type=int)
     c.set_defaults(func=cmd_config)
 
-    cal = sub.add_parser("calib", help="read/save/restore the battery calibration table")
-    cal.add_argument("--host")
-    cal.add_argument("--save", nargs="?", const=DEFAULT_CAL, metavar="FILE",
-                     help="write the device's table to FILE (default: fs/calibration.json)")
-    cal.add_argument("--restore", nargs="?", const=DEFAULT_CAL, metavar="FILE",
-                     help="upload a table from FILE, replacing what is on the device")
-    cal.set_defaults(func=cmd_calib)
-
     t = sub.add_parser("test", help="cycle agent 0 through colors")
     t.add_argument("--host")
     t.set_defaults(func=cmd_test)
-
-    o = sub.add_parser("ota", help="flash firmware over WiFi (no USB cable)")
-    o.add_argument("--host")
-    o.add_argument("--file", help="image to send (default: the PlatformIO build output)")
-    o.add_argument("--fs", action="store_true",
-                   help="send the LittleFS image (web UI) instead of the firmware")
-    o.set_defaults(func=cmd_ota)
 
     u = sub.add_parser("unpair", help="forget local pairing")
     u.set_defaults(func=cmd_unpair)

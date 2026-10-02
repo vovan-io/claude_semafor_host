@@ -5,6 +5,9 @@ short-lived processes, so the link is WiFi HTTP: on each event `semafor.py` POST
 to the device (`semafor.local`). No dependencies — the Python 3 standard library
 only (`curl` is not required).
 
+The device firmware, OTA updates and battery calibration tooling live in the
+separate firmware repository (`claude_semafor`).
+
 ## How it works
 
 ```
@@ -29,7 +32,7 @@ occupy the LEDs of the strip while that host is active.
 ```sh
 # 1) copy the script into ~/.claude and add the hooks to settings.json (idempotent;
 #    existing settings are preserved and a settings.json.bak is created)
-python3 host/semafor.py install
+python3 semafor.py install
 
 # 2) long-press the button on the device to enter PAIRING (a timer appears on the OLED), then:
 python3 ~/.claude/semafor.py register            # optionally --name "macbook" --host 192.168.1.108
