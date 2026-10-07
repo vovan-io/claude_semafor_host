@@ -76,3 +76,7 @@ TOKEN=$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.c
 curl -H "X-Semafor-Token: $TOKEN" -X POST http://semafor.local/agent/0 -d state=working
 curl http://semafor.local/status
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
