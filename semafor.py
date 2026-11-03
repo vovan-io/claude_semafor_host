@@ -409,7 +409,7 @@ def cmd_notify():
 # Token gauge: what is left of the tighter of the 5-hour / 7-day rate-limit windows.
 # Claude Code hands those to the statusLine command only (no hook carries them), so
 # `semafor.py statusline` stores them in USAGE_PATH and the gauge loop reads that file.
-# Temperature gauge: the hottest CPU die sensor, read without root.
+# Temperature gauge: the hottest CPU core sensor (SMC), read without root.
 
 def cmd_statusline():
     try:
@@ -459,9 +459,117 @@ def tokens_left():
     return max(0.0, min(100.0, 100.0 - max(used)))
 
 
+class _SmcTemps:
+    """Apple Silicon: the CPU core sensors in the SMC — keys "Tp0*"/"Tpx*" (P cores)
+    and "Te0*" (E cores), the family Stats shows. Read through the AppleSMC user client
+    (IOKit via ctypes): no root, no dependencies. The core keys bottom out at 40.0 °C
+    when idle. Measured on an M4 Max: 40 °C idle, ~64 °C after 20 s on all cores."""
+
+    def __init__(self):
+        import ctypes
+        import ctypes.util
+        import struct
+        self.ct, self.struct = ctypes, struct
+        V, U8, U16, U32 = ctypes.c_void_p, ctypes.c_uint8, ctypes.c_uint16, ctypes.c_uint32
+        io = ctypes.CDLL(ctypes.util.find_library("IOKit"))
+        io.IOServiceMatching.restype = V
+        io.IOServiceMatching.argtypes = [ctypes.c_char_p]
+        io.IOServiceGetMatchingService.restype = U32
+        io.IOServiceGetMatchingService.argtypes = [U32, V]
+        io.IOServiceOpen.argtypes = [U32, U32, U32, ctypes.POINTER(U32)]
+        io.IOConnectCallStructMethod.argtypes = [U32, U32, V, ctypes.c_size_t,
+                                                 V, ctypes.POINTER(ctypes.c_size_t)]
+        self.io = io
+
+        class Vers(ctypes.Structure):
+            _fields_ = [("b", U8 * 4), ("release", U16)]
+
+        class PLimit(ctypes.Structure):
+            _fields_ = [("version", U16), ("length", U16),
+                        ("cpu", U32), ("gpu", U32), ("mem", U32)]
+
+        class KeyInfo(ctypes.Structure):
+            _fields_ = [("size", U32), ("type", U32), ("attr", U8)]
+
+        class KeyData(ctypes.Structure):          # SMCKeyData_t, 80 bytes
+            _fields_ = [("key", U32), ("vers", Vers), ("plimit", PLimit),
+                        ("info", KeyInfo), ("result", U8), ("status", U8),
+                        ("cmd", U8), ("data32", U32), ("bytes", U8 * 32)]
+
+        if ctypes.sizeof(KeyData) != 80:
+            raise OSError("SMCKeyData_t layout")
+        self.KeyData = KeyData
+        svc = io.IOServiceGetMatchingService(0, io.IOServiceMatching(b"AppleSMC"))
+        if not svc:
+            raise OSError("no AppleSMC")
+        self.conn = U32()
+        task = U32.in_dll(ctypes.CDLL(None), "mach_task_self_")
+        if io.IOServiceOpen(svc, task, 0, ctypes.byref(self.conn)) != 0:
+            raise OSError("AppleSMC open failed")
+
+        flt = struct.unpack(">I", b"flt ")[0]
+        count = self._read_info_and_value("#KEY")
+        self.keys = []                            # (key code, size) of the core sensors
+        for idx in range(int(count or 0)):
+            d = KeyData()
+            d.cmd, d.data32 = 8, idx              # kSMCGetKeyFromIndex
+            out = self._call(d)
+            if not out:
+                continue
+            name = struct.pack(">I", out.key)
+            # per-core keys only: Tp0*/Tpx* (P cores), Te0* (E cores). Tp1*/Tp2* sit at
+            # 45..53 °C when idle and look like cluster/substrate sensors.
+            if name[:3] not in (b"Tp0", b"Tpx", b"Te0"):
+                continue
+            info = self._info(out.key)
+            if info and info.type == flt and info.size == 4:
+                self.keys.append(out.key)
+        if not self.keys:
+            raise OSError("no CPU core sensors in the SMC")
+
+    def _call(self, d):
+        ct = self.ct
+        out = self.KeyData()
+        n = ct.c_size_t(ct.sizeof(out))
+        r = self.io.IOConnectCallStructMethod(self.conn.value, 2, ct.byref(d), ct.sizeof(d),
+                                              ct.byref(out), ct.byref(n))
+        return out if r == 0 and out.result == 0 else None
+
+    def _info(self, code):
+        d = self.KeyData()
+        d.key, d.cmd = code, 9                    # kSMCGetKeyInfo
+        out = self._call(d)
+        return out.info if out else None
+
+    def _read(self, code, size):
+        d = self.KeyData()
+        d.key, d.cmd = code, 5                    # kSMCReadKey
+        d.info.size = size
+        out = self._call(d)
+        return bytes(out.bytes[:size]) if out else None
+
+    def _read_info_and_value(self, name):         # "#KEY": ui32, big-endian
+        code = self.struct.unpack(">I", name.encode())[0]
+        info = self._info(code)
+        raw = self._read(code, info.size) if info else None
+        return self.struct.unpack(">I", raw)[0] if raw and len(raw) == 4 else None
+
+    def read(self):
+        hottest = None
+        for code in self.keys:
+            raw = self._read(code, 4)
+            if not raw:
+                continue
+            t = self.struct.unpack("<f", raw)[0]
+            if 0 < t < 150 and (hottest is None or t > hottest):
+                hottest = t
+        return hottest
+
+
 class _MacTemps:
-    """Apple Silicon: the IOHID temperature sensors (usage page 0xff00, usage 5).
-    The CPU dies report as "PMU tdie*". ctypes only, no root, no dependencies."""
+    """Fallback when the SMC gives no core sensors: the IOHID temperature sensors
+    (usage page 0xff00, usage 5), "PMU tdie*". NOTE: on an M4 Max these are the PMU
+    die, not the CPU cores — they barely move under load (+2 °C)."""
 
     def __init__(self):
         import ctypes
@@ -586,10 +694,12 @@ def cpu_temp_max():
     if _temp_reader is None:
         _temp_reader = False
         if sys.platform == "darwin":
-            try:
-                _temp_reader = _MacTemps().read
-            except Exception:  # noqa: BLE001  (Intel Mac, sandbox, ...)
-                _temp_reader = False
+            for reader in (_SmcTemps, _MacTemps):
+                try:
+                    _temp_reader = reader().read
+                    break
+                except Exception:  # noqa: BLE001  (Intel Mac, sandbox, ...)
+                    _temp_reader = False
         elif sys.platform.startswith("linux"):
             _temp_reader = _linux_temp
     if not _temp_reader:

@@ -64,9 +64,11 @@ On a board with the two needles the bridge reports, once a second:
 
 - **tokens** — what is left of your usage limit, `100 - used %` of the tighter of
   the 5-hour and 7-day windows (a window past its `resets_at` counts as 100 % left);
-- **temp** — the hottest CPU core in °C: the `PMU tdie*` die sensors on Apple
-  Silicon (IOKit via `ctypes`, no root), `coretemp`/`k10temp` hwmon or the thermal
-  zones on Linux. Intel Macs and Windows report no temperature.
+- **temp** — the hottest CPU core in °C: on Apple Silicon the SMC core sensors
+  `Tp0*`/`Tpx*` (P cores) and `Te0*` (E cores), the ones Stats shows, read through the AppleSMC
+  user client (IOKit via `ctypes`, no root); they bottom out at 40 °C when idle. On
+  Linux `coretemp`/`k10temp` hwmon or the thermal zones. Intel Macs and Windows report
+  no temperature.
 
 Claude Code exposes the limits only to the status line, so `install` sets
 `statusLine` to `semafor.py statusline` (it stores them in
