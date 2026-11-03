@@ -11,7 +11,8 @@ Commands:
   config   [--leds N --bright N --contrast N]   read or set the device settings
   test     [--host H]              cycle agent 0 through the colours (visual check)
   unpair                           forget the local pairing
-  gauge    [--idle-exit S] [--once]  report tokens left + hottest CPU core every second
+  gauge    [--once] [--wait]       report tokens left + hottest CPU core every second
+  autostart [--off]                run the gauge loop at login (launchd / systemd --user)
   statusline                       statusLine command: stores the session's rate limits
 
 Event mode (invoked from the hooks; the event JSON is read from stdin):
@@ -48,10 +49,15 @@ GAUGE_LOCK = os.path.join(CLAUDE_DIR, "semafor-gauge.lock")   # held by the runn
 GAUGE_LOG = os.path.join(CLAUDE_DIR, "semafor-gauge.log")
 TIMEOUT = 2.5
 
-# Gauge loop (HW4 needles): one report per GAUGE_PERIOD seconds. Started from the
-# hooks, it exits GAUGE_IDLE_EXIT seconds after the last session has ended.
+# Gauge loop (HW4 needles): one report per GAUGE_PERIOD seconds, all the time — not
+# tied to Claude sessions. Started at login by `autostart` (launchd / systemd --user)
+# and, as a fallback, from the hooks. While the device does not answer it retries
+# every GAUGE_RETRY seconds and logs only the changes between up and down.
 GAUGE_PERIOD = 1.0
-GAUGE_IDLE_EXIT = 60
+GAUGE_RETRY = 10.0
+LAUNCHD_LABEL = "io.vovan-io.semafor-gauge"
+LAUNCHD_PLIST = os.path.join(HOME, "Library", "LaunchAgents", LAUNCHD_LABEL + ".plist")
+SYSTEMD_UNIT = os.path.join(HOME, ".config", "systemd", "user", "semafor-gauge.service")
 STATUSLINE_CMD = 'python3 "$HOME/.claude/semafor.py" statusline'
 
 # Hook event -> the state we send to the device.
@@ -162,7 +168,7 @@ def ensure_device_ip(cfg):
     return cfg
 
 
-def device_post(cfg, path, fields):
+def device_post(cfg, path, fields, quiet=False):
     """POST to the device: the stored IP first, then the mDNS name on failure."""
     headers = {"X-Semafor-Token": str(cfg["token"]),
                "Content-Type": "application/x-www-form-urlencoded"}
@@ -177,7 +183,7 @@ def device_post(cfg, path, fields):
             return http_request(t, path, fields, headers)
         except Exception as e:  # noqa: BLE001
             last = e
-    if last:
+    if last and not quiet:
         print("post failed: %s" % last, file=sys.stderr)
     return None
 
@@ -745,8 +751,7 @@ def ensure_gauge_running():
     lf.close()                       # free it for the child (a race just loses its lock)
     try:
         log = open(GAUGE_LOG, "a")
-        subprocess.Popen([sys.executable, os.path.abspath(__file__), "gauge",
-                          "--idle-exit", str(GAUGE_IDLE_EXIT)],
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "gauge"],
                          stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                          start_new_session=True, close_fds=True)
     except OSError as e:
@@ -755,10 +760,10 @@ def ensure_gauge_running():
 
 def cmd_gauge(args):
     cfg = load_json(CFG_PATH, None)
-    if not cfg:
+    if not cfg and args.once:
         print("not paired (run register)", file=sys.stderr)
         return 1
-    cfg = ensure_device_ip(cfg)
+    cfg = ensure_device_ip(cfg) if cfg else {}      # the loop waits for `register`
     if args.once:
         fields = _gauge_fields()
         if not fields:
@@ -769,31 +774,37 @@ def cmd_gauge(args):
         return 0 if r else 1
 
     lock = _open_gauge_lock()
-    if lock is None:
-        print("a gauge loop is already running", file=sys.stderr)
-        return 0
-    idle_since = None
+    while lock is None:
+        if not args.wait:
+            print("a gauge loop is already running", file=sys.stderr)
+            return 0
+        time.sleep(GAUGE_RETRY)          # launchd/systemd: take over when that one ends
+        lock = _open_gauge_lock()
+
+    def log(msg):
+        print("%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg), flush=True)
+
+    log("gauge loop started (pid %d)" % os.getpid())
+    up = None                            # device answering? None = not tried yet
     next_tick = time.monotonic()
     try:
         while True:
-            if args.idle_exit:
-                sessions = load_json(MAP_PATH, {})
-                if sessions:
-                    idle_since = None
-                elif idle_since is None:
-                    idle_since = time.monotonic()
-                elif time.monotonic() - idle_since >= args.idle_exit:
-                    device_post(cfg, "/gauge", {"clear": "1"})   # needles back to rest
-                    return 0
-            fields = _gauge_fields()
+            period = GAUGE_PERIOD
+            cfg = load_json(CFG_PATH, cfg)   # follows a re-pairing or a new IP
+            fields = _gauge_fields() if cfg.get("token") else {}
             if fields:
-                cfg = load_json(CFG_PATH, cfg)   # follows a re-pairing or a new IP
-                if not cfg.get("token"):
-                    return 0                     # unpaired meanwhile
-                device_post(cfg, "/gauge", fields)
-            next_tick += GAUGE_PERIOD
+                ok = device_post(cfg, "/gauge", fields, quiet=True) is not None
+                if ok != up:
+                    log("device %s at %s" % ("up" if ok else "not answering",
+                                             cfg.get("addr") or cfg.get("mdns")))
+                    up = ok
+                if not ok:
+                    period = GAUGE_RETRY
+            elif not cfg.get("token"):
+                period = GAUGE_RETRY         # unpaired: wait for `register`
+            next_tick += period
             delay = next_tick - time.monotonic()
-            if delay < 0:                        # device slow: skip, do not burst
+            if delay < 0:                    # slow device or the Mac slept: no burst
                 next_tick = time.monotonic()
                 delay = 0
             time.sleep(delay)
@@ -801,6 +812,97 @@ def cmd_gauge(args):
         return 0
     finally:
         lock.close()
+
+
+def _autostart_cmd():
+    return [sys.executable, INSTALL_PATH, "gauge", "--wait"]
+
+
+def cmd_autostart(args):
+    """Run the gauge loop at login, as the user (no root): a LaunchAgent on macOS,
+    a systemd user unit on Linux. KeepAlive / Restart bring it back if it dies."""
+    uid = str(os.getuid()) if hasattr(os, "getuid") else ""
+    if sys.platform == "darwin":
+        target = "gui/" + uid
+        subprocess.run(["launchctl", "bootout", target + "/" + LAUNCHD_LABEL],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if args.off:
+            try:
+                os.remove(LAUNCHD_PLIST)
+            except OSError:
+                pass
+            print("autostart off (removed %s)" % LAUNCHD_PLIST)
+            return 0
+        args_xml = "".join("\n    <string>%s</string>" % a for a in _autostart_cmd())
+        plist = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>%s</string>
+  <key>ProgramArguments</key>
+  <array>%s
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>%s</string>
+  <key>StandardErrorPath</key>
+  <string>%s</string>
+</dict>
+</plist>
+""" % (LAUNCHD_LABEL, args_xml, GAUGE_LOG, GAUGE_LOG)
+        os.makedirs(os.path.dirname(LAUNCHD_PLIST), exist_ok=True)
+        with open(LAUNCHD_PLIST, "w") as f:
+            f.write(plist)
+        r = subprocess.run(["launchctl", "bootstrap", target, LAUNCHD_PLIST],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            print("launchctl bootstrap failed: %s" % (r.stderr.strip() or r.returncode),
+                  file=sys.stderr)
+            return 1
+        print("autostart on: %s (log %s)" % (LAUNCHD_PLIST, GAUGE_LOG))
+        return 0
+    if sys.platform.startswith("linux"):
+        ctl = ["systemctl", "--user"]
+        if args.off:
+            subprocess.run(ctl + ["disable", "--now", "semafor-gauge.service"])
+            try:
+                os.remove(SYSTEMD_UNIT)
+            except OSError:
+                pass
+            print("autostart off")
+            return 0
+        unit = """[Unit]
+Description=Claude Semafor gauge reporter (tokens left, CPU temperature)
+After=network-online.target
+
+[Service]
+ExecStart=%s
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
+""" % " ".join('"%s"' % a for a in _autostart_cmd())
+        os.makedirs(os.path.dirname(SYSTEMD_UNIT), exist_ok=True)
+        with open(SYSTEMD_UNIT, "w") as f:
+            f.write(unit)
+        subprocess.run(ctl + ["daemon-reload"])
+        r = subprocess.run(ctl + ["enable", "--now", "semafor-gauge.service"])
+        if r.returncode != 0:
+            return 1
+        print("autostart on: %s" % SYSTEMD_UNIT)
+        return 0
+    print("autostart is not supported on %s; run `semafor.py gauge` yourself" % sys.platform,
+          file=sys.stderr)
+    return 1
 
 
 # ------------------------------------------------------------------ status
@@ -952,6 +1054,9 @@ def cmd_install(args):
     save_json(SETTINGS_PATH, settings)
     print("hooks installed into %s (added %d, removed %d stale, backup .bak)"
           % (SETTINGS_PATH, added, removed))
+    # 4) the gauge loop at login, so the needles do not depend on Claude sessions
+    if sys.platform == "darwin" or sys.platform.startswith("linux"):
+        cmd_autostart(argparse.Namespace(off=False))
     if not load_json(CFG_PATH, None):
         print("next: put device in PAIRING (long press) and run: semafor.py register")
     return 0
@@ -989,10 +1094,14 @@ def build_parser():
     u.set_defaults(func=cmd_unpair)
 
     g = sub.add_parser("gauge", help="report tokens left + hottest CPU core every second")
-    g.add_argument("--idle-exit", type=float, default=0,
-                   help="exit this many seconds after the last session ended (0 = never)")
+    g.add_argument("--wait", action="store_true",
+                   help="if a loop already runs, wait and take over when it ends")
     g.add_argument("--once", action="store_true", help="send one report and exit")
     g.set_defaults(func=cmd_gauge)
+
+    a = sub.add_parser("autostart", help="run the gauge loop at login (no root)")
+    a.add_argument("--off", action="store_true", help="remove the login item")
+    a.set_defaults(func=cmd_autostart)
     return p
 
 
