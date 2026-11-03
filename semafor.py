@@ -11,6 +11,8 @@ Commands:
   config   [--leds N --bright N --contrast N]   read or set the device settings
   test     [--host H]              cycle agent 0 through the colours (visual check)
   unpair                           forget the local pairing
+  gauge    [--idle-exit S] [--once]  report tokens left + hottest CPU core every second
+  statusline                       statusLine command: stores the session's rate limits
 
 Event mode (invoked from the hooks; the event JSON is read from stdin):
   working | attention | done | idle | end
@@ -23,6 +25,7 @@ import json
 import time
 import socket
 import argparse
+import subprocess
 import urllib.request
 import urllib.parse
 from contextlib import contextmanager
@@ -40,7 +43,16 @@ SUBS_PATH = os.path.join(CLAUDE_DIR, "semafor-subs.json")     # session_id -> su
 STATE_PATH = os.path.join(CLAUDE_DIR, "semafor-state.json")   # session_id -> last state
 SETTINGS_PATH = os.path.join(CLAUDE_DIR, "settings.json")
 INSTALL_PATH = os.path.join(CLAUDE_DIR, "semafor.py")
+USAGE_PATH = os.path.join(CLAUDE_DIR, "semafor-usage.json")   # rate limits from the status line
+GAUGE_LOCK = os.path.join(CLAUDE_DIR, "semafor-gauge.lock")   # held by the running gauge loop
+GAUGE_LOG = os.path.join(CLAUDE_DIR, "semafor-gauge.log")
 TIMEOUT = 2.5
+
+# Gauge loop (HW4 needles): one report per GAUGE_PERIOD seconds. Started from the
+# hooks, it exits GAUGE_IDLE_EXIT seconds after the last session has ended.
+GAUGE_PERIOD = 1.0
+GAUGE_IDLE_EXIT = 60
+STATUSLINE_CMD = 'python3 "$HOME/.claude/semafor.py" statusline'
 
 # Hook event -> the state we send to the device.
 STATE_ALIASES = {
@@ -347,6 +359,8 @@ def cmd_event(state_word):
     # A new session -> clear any pending limit alert.
     if state_word == "idle":
         _post_limit(cfg, False)
+    if state_word in ("idle", "working"):
+        ensure_gauge_running()
 
     session_id = read_hook_stdin()
     idx = resolve_index(session_id, release=(state == "offline"),
@@ -389,6 +403,294 @@ def cmd_notify():
     set_last_state(session_id, "attention")
     device_post(cfg, "/agent/%d" % idx, {"state": "attention"})
     return 0
+
+
+# ------------------------------------------------------------------ gauges (HW4)
+# Token gauge: what is left of the tighter of the 5-hour / 7-day rate-limit windows.
+# Claude Code hands those to the statusLine command only (no hook carries them), so
+# `semafor.py statusline` stores them in USAGE_PATH and the gauge loop reads that file.
+# Temperature gauge: the hottest CPU die sensor, read without root.
+
+def cmd_statusline():
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        data = {}
+    rl = data.get("rate_limits") or {}
+    windows = {}
+    for name in ("five_hour", "seven_day"):
+        w = rl.get(name) or {}
+        if isinstance(w.get("used_percentage"), (int, float)):
+            windows[name] = {"used": float(w["used_percentage"]),
+                             "resets_at": w.get("resets_at")}
+    if windows:
+        try:
+            save_json(USAGE_PATH, {"ts": time.time(), "windows": windows})
+        except OSError:
+            pass
+    left = tokens_left()
+    parts = []
+    if left is not None:
+        parts.append("tokens %d%% left" % round(left))
+    t = cpu_temp_max()
+    if t is not None:
+        parts.append("cpu %d°C" % round(t))
+    print(" · ".join(parts) if parts else "semafor")
+    return 0
+
+
+def tokens_left():
+    """Percent left of the tighter window, or None when no window is known.
+    A window whose resets_at has passed counts as fully available again."""
+    usage = load_json(USAGE_PATH, {})
+    now = time.time()
+    used = []
+    for w in (usage.get("windows") or {}).values():
+        try:
+            u = float(w["used"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        r = w.get("resets_at")
+        if isinstance(r, (int, float)) and r <= now:
+            u = 0.0
+        used.append(u)
+    if not used:
+        return None
+    return max(0.0, min(100.0, 100.0 - max(used)))
+
+
+class _MacTemps:
+    """Apple Silicon: the IOHID temperature sensors (usage page 0xff00, usage 5).
+    The CPU dies report as "PMU tdie*". ctypes only, no root, no dependencies."""
+
+    def __init__(self):
+        import ctypes
+        import ctypes.util
+        self.ct = ctypes
+        V = ctypes.c_void_p
+        cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+        io = ctypes.CDLL(ctypes.util.find_library("IOKit"))
+        cf.CFStringCreateWithCString.restype = V
+        cf.CFStringCreateWithCString.argtypes = [V, ctypes.c_char_p, ctypes.c_uint32]
+        cf.CFNumberCreate.restype = V
+        cf.CFNumberCreate.argtypes = [V, ctypes.c_int, V]
+        cf.CFDictionaryCreate.restype = V
+        cf.CFDictionaryCreate.argtypes = [V, V, V, ctypes.c_long, V, V]
+        cf.CFArrayGetCount.restype = ctypes.c_long
+        cf.CFArrayGetCount.argtypes = [V]
+        cf.CFArrayGetValueAtIndex.restype = V
+        cf.CFArrayGetValueAtIndex.argtypes = [V, ctypes.c_long]
+        cf.CFStringGetCString.restype = ctypes.c_bool
+        cf.CFStringGetCString.argtypes = [V, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+        cf.CFRelease.argtypes = [V]
+        io.IOHIDEventSystemClientCreate.restype = V
+        io.IOHIDEventSystemClientCreate.argtypes = [V]
+        io.IOHIDEventSystemClientSetMatching.argtypes = [V, V]
+        io.IOHIDEventSystemClientCopyServices.restype = V
+        io.IOHIDEventSystemClientCopyServices.argtypes = [V]
+        io.IOHIDServiceClientCopyProperty.restype = V
+        io.IOHIDServiceClientCopyProperty.argtypes = [V, V]
+        io.IOHIDServiceClientCopyEvent.restype = V
+        io.IOHIDServiceClientCopyEvent.argtypes = [V, ctypes.c_int64, ctypes.c_int32, ctypes.c_int64]
+        io.IOHIDEventGetFloatValue.restype = ctypes.c_double
+        io.IOHIDEventGetFloatValue.argtypes = [V, ctypes.c_int32]
+        self.cf, self.io = cf, io
+        utf8 = 0x08000100
+
+        def cfstr(text):
+            return cf.CFStringCreateWithCString(None, text.encode(), utf8)
+
+        def cfnum(n):
+            v = ctypes.c_int32(n)
+            return cf.CFNumberCreate(None, 3, ctypes.byref(v))   # kCFNumberSInt32Type
+
+        keys = (V * 2)(cfstr("PrimaryUsagePage"), cfstr("PrimaryUsage"))
+        vals = (V * 2)(cfnum(0xff00), cfnum(5))
+        kcb = V.in_dll(cf, "kCFTypeDictionaryKeyCallBacks")
+        vcb = V.in_dll(cf, "kCFTypeDictionaryValueCallBacks")
+        match = cf.CFDictionaryCreate(None, keys, vals, 2,
+                                      ctypes.addressof(kcb), ctypes.addressof(vcb))
+        self.client = io.IOHIDEventSystemClientCreate(None)
+        io.IOHIDEventSystemClientSetMatching(self.client, match)
+        self.services = io.IOHIDEventSystemClientCopyServices(self.client)
+        if not self.services:
+            raise OSError("no HID temperature services")
+        prop = cfstr("Product")
+        buf = ctypes.create_string_buffer(128)
+        named = []
+        for i in range(cf.CFArrayGetCount(self.services)):
+            sc = cf.CFArrayGetValueAtIndex(self.services, i)
+            name = io.IOHIDServiceClientCopyProperty(sc, prop)
+            if not name:
+                continue
+            ok = cf.CFStringGetCString(name, buf, len(buf), utf8)
+            cf.CFRelease(name)
+            if ok:
+                named.append((buf.value.decode(errors="replace"), sc))
+        # The die sensors; on chips that name them otherwise, the CPU cluster sensors.
+        self.cpu = [sc for n, sc in named if n.startswith("PMU tdie")] or \
+                   [sc for n, sc in named if "ACC" in n or "CPU" in n.upper()]
+        if not self.cpu:
+            raise OSError("no CPU temperature sensors")
+
+    def read(self):
+        temp_event = 15                       # kIOHIDEventTypeTemperature
+        hottest = None
+        for sc in self.cpu:
+            ev = self.io.IOHIDServiceClientCopyEvent(sc, temp_event, 0, 0)
+            if not ev:
+                continue
+            t = self.io.IOHIDEventGetFloatValue(ev, temp_event << 16)
+            self.cf.CFRelease(ev)
+            if 0 < t < 150 and (hottest is None or t > hottest):
+                hottest = t
+        return hottest
+
+
+def _linux_temp():
+    """Linux: hwmon coretemp/k10temp/... (per core), else the thermal zones."""
+    import glob
+    best = None
+    cpu_drivers = ("coretemp", "k10temp", "zenpower", "cpu_thermal", "soc_thermal")
+    for hw in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            with open(os.path.join(hw, "name")) as f:
+                if f.read().strip() not in cpu_drivers:
+                    continue
+        except OSError:
+            continue
+        for p in glob.glob(os.path.join(hw, "temp*_input")):
+            try:
+                with open(p) as f:
+                    t = int(f.read()) / 1000.0
+            except (OSError, ValueError):
+                continue
+            best = t if best is None else max(best, t)
+    if best is None:
+        for p in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
+            try:
+                with open(p) as f:
+                    t = int(f.read()) / 1000.0
+            except (OSError, ValueError):
+                continue
+            best = t if best is None else max(best, t)
+    return best
+
+
+_temp_reader = None
+
+
+def cpu_temp_max():
+    """Hottest CPU core / die in °C, or None when this platform cannot tell."""
+    global _temp_reader
+    if _temp_reader is None:
+        _temp_reader = False
+        if sys.platform == "darwin":
+            try:
+                _temp_reader = _MacTemps().read
+            except Exception:  # noqa: BLE001  (Intel Mac, sandbox, ...)
+                _temp_reader = False
+        elif sys.platform.startswith("linux"):
+            _temp_reader = _linux_temp
+    if not _temp_reader:
+        return None
+    try:
+        return _temp_reader()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _gauge_fields():
+    fields = {}
+    left = tokens_left()
+    if left is not None:
+        fields["pct"] = "%.1f" % left
+    t = cpu_temp_max()
+    if t is not None:
+        fields["temp"] = "%.1f" % max(-50.0, min(250.0, t))
+    return fields
+
+
+def _open_gauge_lock():
+    """The lock file held for the loop's lifetime, or None if a loop already runs."""
+    if fcntl is None:
+        return open(GAUGE_LOCK, "w")
+    os.makedirs(CLAUDE_DIR, exist_ok=True)
+    lf = open(GAUGE_LOCK, "w")
+    try:
+        fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lf.close()
+        return None
+    return lf
+
+
+def ensure_gauge_running():
+    """From a hook: start the gauge loop in the background unless one already runs."""
+    if fcntl is None:
+        return                       # no single-instance guard -> run `gauge` by hand
+    lf = _open_gauge_lock()
+    if lf is None:
+        return                       # already running
+    lf.close()                       # free it for the child (a race just loses its lock)
+    try:
+        log = open(GAUGE_LOG, "a")
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "gauge",
+                          "--idle-exit", str(GAUGE_IDLE_EXIT)],
+                         stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                         start_new_session=True, close_fds=True)
+    except OSError as e:
+        print("gauge start failed: %s" % e, file=sys.stderr)
+
+
+def cmd_gauge(args):
+    cfg = load_json(CFG_PATH, None)
+    if not cfg:
+        print("not paired (run register)", file=sys.stderr)
+        return 1
+    cfg = ensure_device_ip(cfg)
+    if args.once:
+        fields = _gauge_fields()
+        if not fields:
+            print("nothing to report (no rate limits yet, no temperature sensor)")
+            return 1
+        r = device_post(cfg, "/gauge", fields)
+        print("sent %s -> %s" % (fields, r[1] if r else "no answer"))
+        return 0 if r else 1
+
+    lock = _open_gauge_lock()
+    if lock is None:
+        print("a gauge loop is already running", file=sys.stderr)
+        return 0
+    idle_since = None
+    next_tick = time.monotonic()
+    try:
+        while True:
+            if args.idle_exit:
+                sessions = load_json(MAP_PATH, {})
+                if sessions:
+                    idle_since = None
+                elif idle_since is None:
+                    idle_since = time.monotonic()
+                elif time.monotonic() - idle_since >= args.idle_exit:
+                    device_post(cfg, "/gauge", {"clear": "1"})   # needles back to rest
+                    return 0
+            fields = _gauge_fields()
+            if fields:
+                cfg = load_json(CFG_PATH, cfg)   # follows a re-pairing or a new IP
+                if not cfg.get("token"):
+                    return 0                     # unpaired meanwhile
+                device_post(cfg, "/gauge", fields)
+            next_tick += GAUGE_PERIOD
+            delay = next_tick - time.monotonic()
+            if delay < 0:                        # device slow: skip, do not burst
+                next_tick = time.monotonic()
+                delay = 0
+            time.sleep(delay)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        lock.close()
 
 
 # ------------------------------------------------------------------ status
@@ -455,7 +757,7 @@ def cmd_test(args):
 
 # ------------------------------------------------------------------ unpair
 def cmd_unpair(_args):
-    for p in (CFG_PATH, MAP_PATH, SUBS_PATH, STATE_PATH):
+    for p in (CFG_PATH, MAP_PATH, SUBS_PATH, STATE_PATH, USAGE_PATH):
         try:
             os.remove(p)
             print("removed %s" % p)
@@ -527,6 +829,16 @@ def cmd_install(args):
             continue
         groups.append(entry)
         added += 1
+
+    # 3) the status line: the only place Claude Code exposes the rate limits
+    #    (for the token gauge). Someone else's status line is left alone.
+    sl = settings.get("statusLine")
+    if not sl:
+        settings["statusLine"] = {"type": "command", "command": STATUSLINE_CMD}
+        print("statusLine set -> semafor.py statusline")
+    elif "semafor.py" not in str(sl.get("command", "")):
+        print("statusLine already set to %r — left alone. For the token gauge, pipe its "
+              "stdin through: %s" % (sl.get("command"), STATUSLINE_CMD))
     save_json(SETTINGS_PATH, settings)
     print("hooks installed into %s (added %d, removed %d stale, backup .bak)"
           % (SETTINGS_PATH, added, removed))
@@ -565,6 +877,12 @@ def build_parser():
 
     u = sub.add_parser("unpair", help="forget local pairing")
     u.set_defaults(func=cmd_unpair)
+
+    g = sub.add_parser("gauge", help="report tokens left + hottest CPU core every second")
+    g.add_argument("--idle-exit", type=float, default=0,
+                   help="exit this many seconds after the last session ended (0 = never)")
+    g.add_argument("--once", action="store_true", help="send one report and exit")
+    g.set_defaults(func=cmd_gauge)
     return p
 
 
@@ -578,6 +896,8 @@ def main(argv):
         return cmd_notify()
     if len(argv) == 1 and argv[0] in LIMIT_EVENTS:
         return cmd_limit(argv[0] == "limit")
+    if len(argv) == 1 and argv[0] == "statusline":
+        return cmd_statusline()
 
     parser = build_parser()
     args = parser.parse_args(argv)

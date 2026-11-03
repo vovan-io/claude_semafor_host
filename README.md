@@ -53,9 +53,38 @@ semafor.py config --leds 8           # set the LED count (persisted to NVS)
 semafor.py config --bright 128 --contrast 100
 semafor.py test                      # cycle agent 0 through the colours (strip check)
 semafor.py unpair                    # forget the local pairing
+semafor.py gauge [--once]            # report tokens left + CPU temperature (HW4)
 ```
 
 Any command can be aimed at a specific address with `--host 192.168.1.108`.
+
+## Gauges (HW4)
+
+On a board with the two needles the bridge reports, once a second:
+
+- **tokens** — what is left of your usage limit, `100 - used %` of the tighter of
+  the 5-hour and 7-day windows (a window past its `resets_at` counts as 100 % left);
+- **temp** — the hottest CPU core in °C: the `PMU tdie*` die sensors on Apple
+  Silicon (IOKit via `ctypes`, no root), `coretemp`/`k10temp` hwmon or the thermal
+  zones on Linux. Intel Macs and Windows report no temperature.
+
+Claude Code exposes the limits only to the status line, so `install` sets
+`statusLine` to `semafor.py statusline` (it stores them in
+`~/.claude/semafor-usage.json` and prints `tokens 62% left · cpu 41°C`). The limits
+are there for claude.ai Pro/Max subscribers only, after the session's first reply;
+until then only the temperature is sent. If you already have a status line,
+`install` leaves it alone; pipe its stdin into `semafor.py statusline` as well.
+
+The report loop, `semafor.py gauge`, is started by the `SessionStart` /
+`UserPromptSubmit` / `PreToolUse` hooks (one instance, guarded by
+`~/.claude/semafor-gauge.lock`; log in `~/.claude/semafor-gauge.log`). It exits
+60 s after the last session has ended and drops both values, so the needles fall back
+to rest. A board without the gauges answers `present:false` and ignores the values.
+
+```sh
+semafor.py gauge --once              # one report, prints what the device stored
+semafor.py gauge                     # run in the foreground, never exits on idle
+```
 
 ## Several computers
 
