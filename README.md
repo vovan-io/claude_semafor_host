@@ -77,15 +77,14 @@ are there for claude.ai Pro/Max subscribers only, after the session's first repl
 until then only the temperature is sent. If you already have a status line,
 `install` leaves it alone; pipe its stdin into `semafor.py statusline` as well.
 
-The report loop, `semafor.py gauge`, runs all the time, not only while Claude Code is
-open: `install` registers it to start at login, as your user, with no root — a
-LaunchAgent (`~/Library/LaunchAgents/io.vovan-io.semafor-gauge.plist`) on macOS, a
-systemd user unit on Linux. launchd/systemd restart it if it dies. The hooks also
-start it if it is not running. One instance only, guarded by
+The report loop, `semafor.py gauge`, is started by the first hook of the first
+Claude Code session (`SessionStart` / `UserPromptSubmit` / `PreToolUse`). From then on
+it runs until logout or reboot, whether or not any session is open: the temperature
+keeps coming, and after the last session the token needle keeps the last known value
+(a window past its `resets_at` goes back to 100 %). One instance only, guarded by
 `~/.claude/semafor-gauge.lock`; log in `~/.claude/semafor-gauge.log` (only the
 up/down changes of the device). When the device does not answer the loop retries
-every 10 s. After the last session the token needle keeps the last known value;
-a window past its `resets_at` goes back to 100 %.
+every 10 s.
 
 Every computer reports into its own host slot. The needles show the **active** host:
 switch hosts with a short button press (or in the web UI) to see another machine's
@@ -94,7 +93,6 @@ temperature. A board without the gauges answers `present:false` and ignores the 
 ```sh
 semafor.py gauge --once              # one report, prints what the device stored
 semafor.py gauge                     # run in the foreground
-semafor.py autostart [--off]         # start the loop at login, or stop doing so
 ```
 
 ## Several computers

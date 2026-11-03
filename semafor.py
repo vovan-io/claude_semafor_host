@@ -11,8 +11,7 @@ Commands:
   config   [--leds N --bright N --contrast N]   read or set the device settings
   test     [--host H]              cycle agent 0 through the colours (visual check)
   unpair                           forget the local pairing
-  gauge    [--once] [--wait]       report tokens left + hottest CPU core every second
-  autostart [--off]                run the gauge loop at login (launchd / systemd --user)
+  gauge    [--once]                report tokens left + hottest CPU core every second
   statusline                       statusLine command: stores the session's rate limits
 
 Event mode (invoked from the hooks; the event JSON is read from stdin):
@@ -49,15 +48,12 @@ GAUGE_LOCK = os.path.join(CLAUDE_DIR, "semafor-gauge.lock")   # held by the runn
 GAUGE_LOG = os.path.join(CLAUDE_DIR, "semafor-gauge.log")
 TIMEOUT = 2.5
 
-# Gauge loop (HW4 needles): one report per GAUGE_PERIOD seconds, all the time — not
-# tied to Claude sessions. Started at login by `autostart` (launchd / systemd --user)
-# and, as a fallback, from the hooks. While the device does not answer it retries
+# Gauge loop (HW4 needles): one report per GAUGE_PERIOD seconds. The first hook of
+# the first Claude session starts it; from then on it runs until logout or reboot,
+# whether or not any session is open. While the device does not answer it retries
 # every GAUGE_RETRY seconds and logs only the changes between up and down.
 GAUGE_PERIOD = 1.0
 GAUGE_RETRY = 10.0
-LAUNCHD_LABEL = "io.vovan-io.semafor-gauge"
-LAUNCHD_PLIST = os.path.join(HOME, "Library", "LaunchAgents", LAUNCHD_LABEL + ".plist")
-SYSTEMD_UNIT = os.path.join(HOME, ".config", "systemd", "user", "semafor-gauge.service")
 STATUSLINE_CMD = 'python3 "$HOME/.claude/semafor.py" statusline'
 
 # Hook event -> the state we send to the device.
@@ -774,12 +770,9 @@ def cmd_gauge(args):
         return 0 if r else 1
 
     lock = _open_gauge_lock()
-    while lock is None:
-        if not args.wait:
-            print("a gauge loop is already running", file=sys.stderr)
-            return 0
-        time.sleep(GAUGE_RETRY)          # launchd/systemd: take over when that one ends
-        lock = _open_gauge_lock()
+    if lock is None:
+        print("a gauge loop is already running", file=sys.stderr)
+        return 0
 
     def log(msg):
         print("%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg), flush=True)
@@ -812,97 +805,6 @@ def cmd_gauge(args):
         return 0
     finally:
         lock.close()
-
-
-def _autostart_cmd():
-    return [sys.executable, INSTALL_PATH, "gauge", "--wait"]
-
-
-def cmd_autostart(args):
-    """Run the gauge loop at login, as the user (no root): a LaunchAgent on macOS,
-    a systemd user unit on Linux. KeepAlive / Restart bring it back if it dies."""
-    uid = str(os.getuid()) if hasattr(os, "getuid") else ""
-    if sys.platform == "darwin":
-        target = "gui/" + uid
-        subprocess.run(["launchctl", "bootout", target + "/" + LAUNCHD_LABEL],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if args.off:
-            try:
-                os.remove(LAUNCHD_PLIST)
-            except OSError:
-                pass
-            print("autostart off (removed %s)" % LAUNCHD_PLIST)
-            return 0
-        args_xml = "".join("\n    <string>%s</string>" % a for a in _autostart_cmd())
-        plist = """<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>%s</string>
-  <key>ProgramArguments</key>
-  <array>%s
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>ThrottleInterval</key>
-  <integer>30</integer>
-  <key>ProcessType</key>
-  <string>Background</string>
-  <key>StandardOutPath</key>
-  <string>%s</string>
-  <key>StandardErrorPath</key>
-  <string>%s</string>
-</dict>
-</plist>
-""" % (LAUNCHD_LABEL, args_xml, GAUGE_LOG, GAUGE_LOG)
-        os.makedirs(os.path.dirname(LAUNCHD_PLIST), exist_ok=True)
-        with open(LAUNCHD_PLIST, "w") as f:
-            f.write(plist)
-        r = subprocess.run(["launchctl", "bootstrap", target, LAUNCHD_PLIST],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            print("launchctl bootstrap failed: %s" % (r.stderr.strip() or r.returncode),
-                  file=sys.stderr)
-            return 1
-        print("autostart on: %s (log %s)" % (LAUNCHD_PLIST, GAUGE_LOG))
-        return 0
-    if sys.platform.startswith("linux"):
-        ctl = ["systemctl", "--user"]
-        if args.off:
-            subprocess.run(ctl + ["disable", "--now", "semafor-gauge.service"])
-            try:
-                os.remove(SYSTEMD_UNIT)
-            except OSError:
-                pass
-            print("autostart off")
-            return 0
-        unit = """[Unit]
-Description=Claude Semafor gauge reporter (tokens left, CPU temperature)
-After=network-online.target
-
-[Service]
-ExecStart=%s
-Restart=always
-RestartSec=30
-
-[Install]
-WantedBy=default.target
-""" % " ".join('"%s"' % a for a in _autostart_cmd())
-        os.makedirs(os.path.dirname(SYSTEMD_UNIT), exist_ok=True)
-        with open(SYSTEMD_UNIT, "w") as f:
-            f.write(unit)
-        subprocess.run(ctl + ["daemon-reload"])
-        r = subprocess.run(ctl + ["enable", "--now", "semafor-gauge.service"])
-        if r.returncode != 0:
-            return 1
-        print("autostart on: %s" % SYSTEMD_UNIT)
-        return 0
-    print("autostart is not supported on %s; run `semafor.py gauge` yourself" % sys.platform,
-          file=sys.stderr)
-    return 1
 
 
 # ------------------------------------------------------------------ status
@@ -1054,9 +956,6 @@ def cmd_install(args):
     save_json(SETTINGS_PATH, settings)
     print("hooks installed into %s (added %d, removed %d stale, backup .bak)"
           % (SETTINGS_PATH, added, removed))
-    # 4) the gauge loop at login, so the needles do not depend on Claude sessions
-    if sys.platform == "darwin" or sys.platform.startswith("linux"):
-        cmd_autostart(argparse.Namespace(off=False))
     if not load_json(CFG_PATH, None):
         print("next: put device in PAIRING (long press) and run: semafor.py register")
     return 0
@@ -1094,14 +993,8 @@ def build_parser():
     u.set_defaults(func=cmd_unpair)
 
     g = sub.add_parser("gauge", help="report tokens left + hottest CPU core every second")
-    g.add_argument("--wait", action="store_true",
-                   help="if a loop already runs, wait and take over when it ends")
     g.add_argument("--once", action="store_true", help="send one report and exit")
     g.set_defaults(func=cmd_gauge)
-
-    a = sub.add_parser("autostart", help="run the gauge loop at login (no root)")
-    a.add_argument("--off", action="store_true", help="remove the login item")
-    a.set_defaults(func=cmd_autostart)
     return p
 
 
